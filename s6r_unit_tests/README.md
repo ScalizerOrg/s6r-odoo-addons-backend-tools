@@ -56,7 +56,7 @@ fields_logger.get_fields_message_to_skip = get_fields_message_to_skip
 
 #### Authors
 
-* Michel Perrocheau
+* Scalizer
 
 #### Contributors
 
@@ -64,9 +64,6 @@ fields_logger.get_fields_message_to_skip = get_fields_message_to_skip
 
 #### Maintainers
 
-
 This module is maintained by [Scalizer](https://www.scalizer.fr).
 
 ![Scalizer](./static/description/logo.png)
-
-
