@@ -8,11 +8,11 @@ _logger = logging.getLogger(__name__)
 run_suite_origin = loader.run_suite
 
 
-def run_suite(suite):
+def run_suite(suite, module_name=None, global_report=None):
     tests_to_skip = list(filter(lambda t: skip_unit_test(t), suite._tests))
     for test in tests_to_skip:
         _logger.info(f"Skipping unit test: {test}")
         suite._tests.remove(test)
-    return run_suite_origin(suite)
+    return run_suite_origin(suite, module_name, global_report=global_report)
 
 loader.run_suite = run_suite
