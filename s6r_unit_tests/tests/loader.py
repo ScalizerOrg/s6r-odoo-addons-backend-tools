@@ -11,7 +11,7 @@ run_suite_origin = loader.run_suite
 
 def run_suite(suite, module_name=None, global_report=None):
     suite._tests = list(filter(lambda t: not skip_unit_test(t), suite._tests))
-    return run_suite_origin(suite, module_name)
+    return run_suite_origin(suite, module_name, global_report=global_report)
 
 
 loader.run_suite = run_suite
