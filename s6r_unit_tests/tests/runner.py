@@ -1,7 +1,7 @@
 # Copyright 2023 Scalizer (<https://www.scalizer.fr>)
 # License LGPL-3.0 or later (https://www.gnu.org/licenses/lgpl.html).
 
-from odoo.tests.loader import OdooTestResult
+from odoo.tests.result import OdooTestResult
 import logging
 
 _logger = logging.getLogger(__name__)
