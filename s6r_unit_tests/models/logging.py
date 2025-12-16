@@ -1,7 +1,8 @@
 # Copyright 2023 Scalizer (<https://www.scalizer.fr>)
 # License LGPL-3.0 or later (https://www.gnu.org/licenses/lgpl.html).
 
-from odoo.fields import _logger as fields_logger
+import logging
+fields_logger = logging.getLogger('odoo.fields')
 
 
 def get_fields_message_to_skip():
