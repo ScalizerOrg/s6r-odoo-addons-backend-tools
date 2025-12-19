@@ -31,7 +31,10 @@ def skip_unit_test(test):
         if hasattr(test, 'test_module') and excluded_test['module'] == test.test_module:
             if excluded_test['class'] == 'all':
                 return True
-            elif excluded_test['class'] == test.test_class:
+            elif hasattr(test, 'test_class') and excluded_test['class'] == test.test_class:
+                if excluded_test['method'] in ['all', test._testMethodName]:
+                    return True
+            elif hasattr(test, '__class__') and excluded_test['class'] == test.__class__.__name__:
                 if excluded_test['method'] in ['all', test._testMethodName]:
                     return True
 
