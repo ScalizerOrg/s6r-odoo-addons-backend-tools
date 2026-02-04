@@ -7,3 +7,4 @@ if config['test_enable']:
     from . import runner
     from . import loader
     from . import common
+    from . import test_patch_invisible_fields
