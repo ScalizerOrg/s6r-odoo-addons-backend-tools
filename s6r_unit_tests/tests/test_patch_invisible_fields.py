@@ -59,7 +59,6 @@ def patched_test_uncommented_invisible_field(self):
         'appointment',
         'approvals',
         'approvals_purchase_stock',
-        'auth_signup',
         'auth_totp',
         'barcodes_gs1_nomenclature',
         'base_address_extended',
