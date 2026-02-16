@@ -347,7 +347,6 @@ def patched_test_uncommented_invisible_field(self):
         'sale_planning',
         'sale_product_matrix',
         'sale_project',
-        'sale_purchase',
         'sale_renting',
         'sale_renting_crm',
         'sale_stock_renting',
