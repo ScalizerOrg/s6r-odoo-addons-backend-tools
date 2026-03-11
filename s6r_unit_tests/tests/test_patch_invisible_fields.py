@@ -266,7 +266,6 @@ def patched_test_uncommented_invisible_field(self):
         'loyalty',
         'lunch',
         'mail',
-        'mail_bot_hr',
         'mail_group',
         'maintenance',
         'maintenance_worksheet',
