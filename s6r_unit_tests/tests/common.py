@@ -1,10 +1,12 @@
 # Copyright 2023 Scalizer (<https://www.scalizer.fr>)
 # License LGPL-3.0 or later (https://www.gnu.org/licenses/lgpl.html).
-import re
-import copy
-from odoo.tests.common import ChromeBrowser
-_handle_console_origin = ChromeBrowser._handle_console
-_handle_exception_origin = ChromeBrowser._handle_exception
+from odoo.tools import config
+if config['test_enable']:
+    import re
+    import copy
+    from odoo.tests.common import ChromeBrowser
+    _handle_console_origin = ChromeBrowser._handle_console
+    _handle_exception_origin = ChromeBrowser._handle_exception
 
 
 def get_console_message_to_skip(self):
@@ -17,8 +19,8 @@ def get_console_message_to_skip(self):
     """
     return []
 
-
-ChromeBrowser.get_console_message_to_skip = get_console_message_to_skip
+if config['test_enable']:
+    ChromeBrowser.get_console_message_to_skip = get_console_message_to_skip
 
 
 def get_formatted_message(self, args):
@@ -31,8 +33,8 @@ def get_formatted_message(self, args):
     formatted.extend(str(self._from_remoteobject(arg)) for arg in args)
     return ' '.join(formatted)
 
-
-ChromeBrowser.get_formatted_message = get_formatted_message
+if config['test_enable']:
+    ChromeBrowser.get_formatted_message = get_formatted_message
 
 
 def _handle_console(self, type, args=None, stackTrace=None, **kw):
@@ -43,8 +45,8 @@ def _handle_console(self, type, args=None, stackTrace=None, **kw):
                 return
     _handle_console_origin(self, type, args, stackTrace, **kw)
 
-
-ChromeBrowser._handle_console = _handle_console
+if config['test_enable']:
+    ChromeBrowser._handle_console = _handle_console
 
 
 def _handle_exception(self, exceptionDetails, timestamp):
@@ -55,4 +57,5 @@ def _handle_exception(self, exceptionDetails, timestamp):
     _handle_exception_origin(self, exceptionDetails, timestamp)
 
 
-ChromeBrowser._handle_exception = _handle_exception
+if config['test_enable']:
+    ChromeBrowser._handle_exception = _handle_exception
