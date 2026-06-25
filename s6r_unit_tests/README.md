@@ -9,6 +9,7 @@ This is a technical module. This requires a custom module to inherit it.
 
 * [Usage](#usage)
   * [Skip failing python unit tests](skip-failing-python-unit-tests)
+  * [Trim the always-invisible-fields whitelist](trim-the-always-invisible-fields-whitelist)
   * [Avoid warnings on fields](avoid-warnings-on-fields)
 * [Contributors](#contributors)
 * [Maintainers](#maintainers)
@@ -39,6 +40,45 @@ def get_excluded_tests():
 
 OdooTestResult.get_excluded_tests = get_excluded_tests
 ```
+
+
+### Trim the always-invisible-fields whitelist
+
+`s6r_unit_tests` patches the standard `TestInvisibleField.test_uncommented_invisible_field` test (see `tests/test_patch_invisible_fields.py`). The patched test downgrades the standard / enterprise modules listed in the module-level `ONLY_LOG_MODULES` tuple from errors to log entries, and conversely raises an error for any whitelisted module that no longer has any uncommented always-invisible field:
+
+```
+Please remove this module names from the white list of this current test: [...]
+```
+
+`ONLY_LOG_MODULES` is intentionally exposed as a module-level constant so that project-specific overrides can shrink (or extend) it without touching the upstream module. In your custom module, in the `tests` directory, add a file `test_patch_invisible_fields.py` and reassign `ONLY_LOG_MODULES` like in the example below.
+
+```python
+from odoo.addons.s6r_unit_tests.tests import test_patch_invisible_fields
+
+# Modules to drop from the upstream ONLY_LOG_MODULES whitelist for this
+# project (e.g. modules that no longer have any uncommented always-invisible
+# field in the target version).
+REMOVE_FROM_WHITELIST = frozenset({
+    'mrp_workorder_expiry',
+    'mrp_workorder_iot',
+})
+
+test_patch_invisible_fields.ONLY_LOG_MODULES = tuple(
+    module
+    for module in test_patch_invisible_fields.ONLY_LOG_MODULES
+    if module not in REMOVE_FROM_WHITELIST
+)
+```
+
+To **add** project-specific modules to the whitelist instead, append to the tuple:
+
+```python
+test_patch_invisible_fields.ONLY_LOG_MODULES += (
+    'my_project_module_with_legit_always_invisible_fields',
+)
+```
+
+The override must be imported from the custom module's `tests/__init__.py` (guarded by `config["test_enable"]`) so that the reassignment happens before the test runs.
 
 
 ### Avoid warnings on fields
