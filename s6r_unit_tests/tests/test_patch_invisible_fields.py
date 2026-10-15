@@ -2,7 +2,7 @@ import logging
 import re
 from collections import defaultdict
 
-from odoo.addons.base.tests.test_views import TestInvisibleField
+from odoo.addons.base.tests.test_ir_ui_view import TestInvisibleField
 
 _logger = logging.getLogger(__name__)
 
