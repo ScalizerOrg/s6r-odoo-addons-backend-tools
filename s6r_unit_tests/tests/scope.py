@@ -23,8 +23,12 @@ Activation (environment variables):
 * ``S6R_UT_SCOPE``: ``1`` forces the targeted mode, ``0`` disables it.
   When unset, it is enabled on Odoo.sh development builds only
   (``ODOO_STAGE=dev``).
-* ``S6R_UT_BASE_REF``: git reference to diff against. When unset, the first
-  existing reference of ``DEFAULT_BASE_REFS`` is used.
+* ``S6R_UT_BASE_REF``: git reference to diff against. When unset, it is
+  detected among the local and remote branches whose name matches
+  ``BASE_BRANCH_RE`` (``staging``, ``Staging``, ``staging-migration-19``,
+  ``16.0_staging``, ``main``...): the closest one to ``HEAD`` is used, i.e. the
+  one ``HEAD`` is the fewest commits ahead of, then behind. Branches into
+  which ``HEAD`` was already merged are ignored.
 * ``S6R_UT_REPO``: path of the project repository. When unset, it is the git
   superproject of this module (or its own repository).
 * ``S6R_UT_SCOPE_DEPENDS``: ``0`` to skip the direct ``depends`` of the
@@ -38,18 +42,14 @@ commit message contains ``FULL_SUITE_MARKER``.
 import ast
 import logging
 import os
+import re
 import subprocess
 
 _logger = logging.getLogger(__name__)
 
-DEFAULT_BASE_REFS = [
-    "origin/staging",
-    "origin/main",
-    "origin/master",
-    "staging",
-    "main",
-    "master",
-]
+# Name of the branches a development branch can be created from, without the
+# remote prefix. Matched case-insensitively.
+BASE_BRANCH_RE = re.compile(r"^(\d+\.\d+[_-])?(staging|main|master)([_-].*)?$", re.IGNORECASE)
 FULL_SUITE_MARKER = "[full-tests]"
 FULL_SUITE_FILES = {"requirements.txt"}
 SUBMODULE_MODE = "160000"
@@ -95,22 +95,75 @@ def find_repo_root(start):
     return superproject or _git(start, "rev-parse", "--show-toplevel")
 
 
-def resolve_base_ref(repo, candidates):
-    """Return the first reference of ``candidates`` existing in ``repo``.
+def verify_ref(repo, ref):
+    """Check that ``ref`` is a commit of ``repo``.
 
     :param str repo: path of the git working tree
-    :param list[str] candidates: references to try, in order
-    :return: the existing reference
+    :param str ref: git reference
+    :return: ``ref``
     :rtype: str
-    :raises ScopeUnavailable: if none exists
+    :raises ScopeUnavailable: if the reference does not exist
     """
+    try:
+        _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    except ScopeUnavailable as error:
+        raise ScopeUnavailable(f"the base reference {ref} does not exist in {repo}") from error
+    return ref
+
+
+def base_branch_candidates(repo):
+    """Return the local and remote branches that may be the base of ``HEAD``.
+
+    :param str repo: path of the git working tree
+    :return: short reference names (``staging``, ``origin/staging``...)
+    :rtype: list[str]
+    """
+    refs = _git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes")
+    candidates = []
+    for ref in refs.splitlines():
+        name = ref.split("/", 1)[1] if ref.startswith(("origin/", "upstream/")) else ref
+        if name != "HEAD" and BASE_BRANCH_RE.match(name):
+            candidates.append(ref)
+    return candidates
+
+
+def detect_base_ref(repo, candidates=None):
+    """Return the base branch ``HEAD`` was most likely created from.
+
+    For each candidate, count the commits ``HEAD`` is ahead and behind. The
+    candidate with the fewest commits ahead, then behind, wins. A candidate
+    pointing exactly to ``HEAD`` (new branch without own commit) is returned
+    immediately. Candidates already containing ``HEAD`` with additional
+    commits (branch already merged into them) are ignored.
+
+    :param str repo: path of the git working tree
+    :param list[str] candidates: references to rank, :func:`base_branch_candidates` by default
+    :return: the selected reference
+    :rtype: str
+    :raises ScopeUnavailable: if no candidate is found
+    """
+    if candidates is None:
+        candidates = base_branch_candidates(repo)
+    ranked = []
     for ref in candidates:
         try:
-            _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
-            return ref
-        except ScopeUnavailable:
+            behind, ahead = map(int, _git(repo, "rev-list", "--left-right", "--count", f"{ref}...HEAD").split())
+        except (ScopeUnavailable, ValueError):
             continue
-    raise ScopeUnavailable(f"none of the base references {candidates} exists in {repo}")
+        if not ahead and not behind:
+            # HEAD is the base branch itself: new branch without own commit
+            _logger.info("UT scope: HEAD is at %s, no own commit", ref)
+            return ref
+        if ahead:
+            ranked.append((ahead, behind, ref))
+    if not ranked:
+        raise ScopeUnavailable(f"no base branch found among {candidates} in {repo}")
+    ranked.sort()
+    _logger.info(
+        "UT scope: base branch candidates (ahead, behind): %s",
+        ", ".join(f"{ref} ({ahead}, {behind})" for ahead, behind, ref in ranked[:5]),
+    )
+    return ranked[0][2]
 
 
 def find_manifests(root):
@@ -281,7 +334,7 @@ def apply_scope(config, environ=None):
             _logger.info("UT scope: %s found in the last commit, running the full suite", FULL_SUITE_MARKER)
             return None
         base_ref = environ.get("S6R_UT_BASE_REF")
-        base_ref = resolve_base_ref(repo, [base_ref] if base_ref else DEFAULT_BASE_REFS)
+        base_ref = verify_ref(repo, base_ref) if base_ref else detect_base_ref(repo)
         files = changed_files(repo, base_ref)
         scope = compute_scope(
             files, find_manifests(repo), with_depends=environ.get("S6R_UT_SCOPE_DEPENDS", "1") != "0"
