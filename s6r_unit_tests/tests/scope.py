@@ -272,6 +272,37 @@ def compute_scope(files, modules, with_depends=True):
     return scope
 
 
+def split_test_tags(spec):
+    """Split a ``test_tags`` value into its filter specs.
+
+    Like ``odoo.tests.tag_selector.TagsSelector``, commas inside ``[...]``
+    parameters or escaped with ``\\`` do not separate specs. The specs are
+    returned as written (escapes kept), so that joining them back with commas
+    gives an equivalent value.
+
+    :param str spec: ``test_tags`` value
+    :return: stripped, non-empty filter specs
+    :rtype: list[str]
+    """
+    parts = [""]
+    bracket_level = 0
+    escape_next = False
+    for char in spec or "":
+        if escape_next:
+            escape_next = False
+        elif char == "\\":
+            escape_next = True
+        elif char == "[":
+            bracket_level += 1
+        elif char == "]":
+            bracket_level = max(bracket_level - 1, 0)
+        elif char == "," and not bracket_level:
+            parts.append("")
+            continue
+        parts[-1] += char
+    return [part.strip() for part in parts if part.strip()]
+
+
 def build_test_tags(scope, existing=None):
     """Combine ``scope`` with the existing ``test_tags`` option.
 
@@ -284,7 +315,7 @@ def build_test_tags(scope, existing=None):
     :return: the new ``test_tags`` value
     :rtype: str
     """
-    specs = [s.strip() for s in (existing or "").split(",") if s.strip()]
+    specs = split_test_tags(existing)
     excludes = [s for s in specs if s.startswith("-")]
     includes = [s.lstrip("+") for s in specs if not s.startswith("-")]
     if not includes:
