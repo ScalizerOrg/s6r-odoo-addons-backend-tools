@@ -12,8 +12,10 @@ Scope of a branch:
 
 * the modules whose files changed (submodule bumps included);
 * the repository modules depending on them, recursively (reverse dependencies);
-* the direct ``depends`` of the changed modules, i.e. the standard / OCA modules
-  they override, except ``IGNORED_DEPENDS``. Only their ``post_install`` tests
+* the ``depends`` of the changed modules, direct and indirect (``sale_stock``,
+  then ``sale``, ``stock``...), i.e. the standard / OCA modules whose models
+  they may override, except ``IGNORED_DEPENDS``. Indirect ``depends`` are read
+  from the manifests of the Odoo addons paths. Only their ``post_install`` tests
   run: their ``at_install`` tests run right after their own installation,
   before the modules depending on them are loaded, so they cannot catch a
   regression caused by an overriding module.
@@ -34,8 +36,8 @@ Activation (environment variables):
   which ``HEAD`` was already merged are ignored.
 * ``S6R_UT_REPO``: path of the project repository. When unset, it is the git
   superproject of this module (or its own repository).
-* ``S6R_UT_SCOPE_DEPENDS``: ``0`` to skip the direct ``depends`` of the
-  changed modules.
+* ``S6R_UT_SCOPE_DEPENDS``: ``0`` to skip the ``depends`` of the changed
+  modules, ``direct`` to keep only their direct ``depends``.
 
 The full suite is run whenever the scope cannot be computed reliably (no git,
 unknown base reference, changes in ``FULL_SUITE_FILES``), or when the last
@@ -58,10 +60,46 @@ FULL_SUITE_FILES = {"requirements.txt"}
 SUBMODULE_MODE = "160000"
 # Fallback scope when no module changed: keep a minimal sanity run.
 EMPTY_SCOPE = {"s6r_unit_tests"}
-# Framework modules nearly every module depends on: testing them for each
-# branch would cancel the benefit of the targeted mode. Their regressions are
-# caught by the full suite (staging, daily testing branch).
-IGNORED_DEPENDS = {"base", "web"}
+# Framework modules nearly every module depends on, directly or not: testing
+# them for each branch would cancel the benefit of the targeted mode, and their
+# heavy post_install suites (HTTP cases, tours, JS) rarely relate to a custom
+# module. They are still tested when they are themselves changed, and their
+# regressions are caught by the full suite (staging, daily testing branch).
+IGNORED_DEPENDS = {
+    # core
+    "base",
+    "base_import",
+    "base_setup",
+    "bus",
+    "http_routing",
+    "web",
+    # web client, editor and UI frameworks
+    "html_editor",
+    "web_cohort",
+    "web_editor",
+    "web_enterprise",
+    "web_gantt",
+    "web_map",
+    "web_mobile",
+    "web_studio",
+    "web_tour",
+    "web_unsplash",
+    # communication and portal
+    "auth_signup",
+    "auth_totp",
+    "digest",
+    "iap",
+    "mail",
+    "mail_bot",
+    "mail_enterprise",
+    "onboarding",
+    "partner_autocomplete",
+    "phone_validation",
+    "portal",
+    "sms",
+    "snailmail",
+    "utm",
+}
 
 
 class ScopeUnavailable(Exception):
@@ -230,12 +268,55 @@ def changed_files(repo, base_ref, head="HEAD"):
     return files
 
 
-def compute_scope(files, modules, with_depends=True):
+def find_all_manifests(paths):
+    """Return the dependencies of the modules found in the given addons paths.
+
+    The first path containing a module wins, as in Odoo's addons path.
+
+    :param list[str] paths: addons paths
+    :return: ``{module_name: (relative_path, [depends])}``
+    :rtype: dict
+    """
+    modules = {}
+    for path in paths:
+        if os.path.isdir(path):
+            for name, value in find_manifests(path).items():
+                modules.setdefault(name, value)
+    return modules
+
+
+def collect_depends(names, modules, transitive=True):
+    """Return the ``depends`` of ``names``, recursively when ``transitive``.
+
+    ``IGNORED_DEPENDS`` are left out of the result but still traversed.
+
+    :param set[str] names: module names
+    :param dict modules: ``{module_name: (path, [depends])}``
+    :param bool transitive: follow the ``depends`` of the ``depends``
+    :return: module names
+    :rtype: set[str]
+    """
+    found = set()
+    todo = [dep for name in names for dep in modules.get(name, ("", []))[1]]
+    while todo:
+        name = todo.pop()
+        if name in found:
+            continue
+        found.add(name)
+        if transitive:
+            todo.extend(modules.get(name, ("", []))[1])
+    return found - IGNORED_DEPENDS
+
+
+def compute_scope(files, modules, with_depends=True, all_modules=None, transitive=True):
     """Return the modules whose tests must run for the given changed files.
 
     :param set[str] files: changed paths, relative to the repository root
-    :param dict modules: result of :func:`find_manifests`
-    :param bool with_depends: include the direct ``depends`` of the changed modules
+    :param dict modules: result of :func:`find_manifests` on the repository
+    :param bool with_depends: include the ``depends`` of the changed modules
+    :param dict all_modules: manifests of every available module, used to follow
+        the indirect ``depends`` (:func:`find_all_manifests`); ``modules`` by default
+    :param bool transitive: include the indirect ``depends`` too
     :return: ``(scope, post_install_only)``: the modules whose tests all run,
         and the direct ``depends`` whose ``post_install`` tests only run
     :rtype: tuple[set[str], set[str]]
@@ -272,8 +353,9 @@ def compute_scope(files, modules, with_depends=True):
     scope |= impacted
     post_install_only = set()
     if with_depends:
-        for name in propagating:
-            post_install_only.update(set(modules[name][1]) - IGNORED_DEPENDS)
+        graph = dict(all_modules or {})
+        graph.update(modules)
+        post_install_only = collect_depends(propagating, graph, transitive)
     return scope, post_install_only - scope
 
 
@@ -354,7 +436,20 @@ def is_enabled(environ=None):
     return environ.get("ODOO_STAGE") == "dev"
 
 
-def apply_scope(config, environ=None):
+def default_addons_paths():
+    """Return the addons paths of the running Odoo, or an empty list.
+
+    :rtype: list[str]
+    """
+    try:
+        import odoo.addons  # noqa: PLC0415
+
+        return list(odoo.addons.__path__)
+    except ImportError:
+        return []
+
+
+def apply_scope(config, environ=None, addons_paths=None):
     """Restrict ``config['test_tags']`` to the modules impacted by the branch.
 
     Does nothing (full suite) when the targeted mode is disabled or the scope
@@ -362,6 +457,8 @@ def apply_scope(config, environ=None):
 
     :param config: Odoo configuration manager
     :param dict environ: environment, ``os.environ`` by default
+    :param list[str] addons_paths: addons paths to read the indirect ``depends``
+        from, those of the running Odoo by default
     :return: the applied ``test_tags``, or ``None`` when the full suite runs
     :rtype: str | None
     """
@@ -376,8 +473,17 @@ def apply_scope(config, environ=None):
         base_ref = environ.get("S6R_UT_BASE_REF")
         base_ref = verify_ref(repo, base_ref) if base_ref else detect_base_ref(repo)
         files = changed_files(repo, base_ref)
+        depends_mode = environ.get("S6R_UT_SCOPE_DEPENDS", "1")
+        transitive = depends_mode != "direct"
+        all_modules = None
+        if depends_mode != "0" and transitive:
+            all_modules = find_all_manifests(default_addons_paths() if addons_paths is None else addons_paths)
         scope, post_install_only = compute_scope(
-            files, find_manifests(repo), with_depends=environ.get("S6R_UT_SCOPE_DEPENDS", "1") != "0"
+            files,
+            find_manifests(repo),
+            with_depends=depends_mode != "0",
+            all_modules=all_modules,
+            transitive=transitive,
         )
     except ScopeUnavailable as error:
         _logger.warning("UT scope: %s, running the full suite", error)
