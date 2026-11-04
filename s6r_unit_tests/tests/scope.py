@@ -13,7 +13,10 @@ Scope of a branch:
 * the modules whose files changed (submodule bumps included);
 * the repository modules depending on them, recursively (reverse dependencies);
 * the direct ``depends`` of the changed modules, i.e. the standard / OCA modules
-  they override, except ``IGNORED_DEPENDS``.
+  they override, except ``IGNORED_DEPENDS``. Only their ``post_install`` tests
+  run: their ``at_install`` tests run right after their own installation,
+  before the modules depending on them are loaded, so they cannot catch a
+  regression caused by an overriding module.
 
 A module whose changes are limited to its ``tests/`` directory does not
 propagate to its reverse dependencies nor to its ``depends``.
@@ -233,8 +236,9 @@ def compute_scope(files, modules, with_depends=True):
     :param set[str] files: changed paths, relative to the repository root
     :param dict modules: result of :func:`find_manifests`
     :param bool with_depends: include the direct ``depends`` of the changed modules
-    :return: module names
-    :rtype: set[str]
+    :return: ``(scope, post_install_only)``: the modules whose tests all run,
+        and the direct ``depends`` whose ``post_install`` tests only run
+    :rtype: tuple[set[str], set[str]]
     :raises ScopeUnavailable: if a file requires the full suite
     """
     if FULL_SUITE_FILES & {os.path.basename(f) for f in files}:
@@ -266,10 +270,11 @@ def compute_scope(files, modules, with_depends=True):
             break
         impacted |= dependents
     scope |= impacted
+    post_install_only = set()
     if with_depends:
         for name in propagating:
-            scope.update(set(modules[name][1]) - IGNORED_DEPENDS)
-    return scope
+            post_install_only.update(set(modules[name][1]) - IGNORED_DEPENDS)
+    return scope, post_install_only - scope
 
 
 def split_test_tags(spec):
@@ -303,18 +308,21 @@ def split_test_tags(spec):
     return [part.strip() for part in parts if part.strip()]
 
 
-def build_test_tags(scope, existing=None):
+def build_test_tags(scope, existing=None, post_install_only=()):
     """Combine ``scope`` with the existing ``test_tags`` option.
 
     Exclusions are kept. Inclusions without module are restricted to the
     scope (``tag`` becomes ``tag/module``), inclusions with a module are kept
-    when the module is in the scope.
+    when the module is in the scope. The ``at_install`` tests of the
+    ``post_install_only`` modules are excluded (``-at_install/module``).
 
-    :param set[str] scope: module names
+    :param set[str] scope: module names whose tests all run
     :param str existing: current value of ``test_tags``
+    :param set[str] post_install_only: module names whose ``post_install`` tests only run
     :return: the new ``test_tags`` value
     :rtype: str
     """
+    modules = set(scope) | set(post_install_only)
     specs = split_test_tags(existing)
     excludes = [s for s in specs if s.startswith("-")]
     includes = [s.lstrip("+") for s in specs if not s.startswith("-")]
@@ -324,11 +332,12 @@ def build_test_tags(scope, existing=None):
     for spec in includes:
         if "/" in spec:
             module = spec.split("/", 1)[1].split(":", 1)[0].split(".", 1)[0]
-            if module in scope:
+            if module in modules:
                 result.append(spec)
             continue
         tag, sep, rest = spec.partition(":")
-        result.extend(f"{tag}/{module}{sep}{rest}" for module in sorted(scope))
+        result.extend(f"{tag}/{module}{sep}{rest}" for module in sorted(modules))
+    excludes = [f"-at_install/{module}" for module in sorted(post_install_only)] + excludes
     return ",".join(result + excludes)
 
 
@@ -367,7 +376,7 @@ def apply_scope(config, environ=None):
         base_ref = environ.get("S6R_UT_BASE_REF")
         base_ref = verify_ref(repo, base_ref) if base_ref else detect_base_ref(repo)
         files = changed_files(repo, base_ref)
-        scope = compute_scope(
+        scope, post_install_only = compute_scope(
             files, find_manifests(repo), with_depends=environ.get("S6R_UT_SCOPE_DEPENDS", "1") != "0"
         )
     except ScopeUnavailable as error:
@@ -375,14 +384,15 @@ def apply_scope(config, environ=None):
         return None
     if not scope:
         scope = set(EMPTY_SCOPE)
-    test_tags = build_test_tags(scope, config["test_tags"])
+    test_tags = build_test_tags(scope, config["test_tags"], post_install_only)
     config["test_tags"] = test_tags
     _logger.info(
-        "UT scope: %d changed file(s) since %s, %d module(s) to test: %s",
+        "UT scope: %d changed file(s) since %s, %d module(s) to test: %s; post_install only: %s",
         len(files),
         base_ref,
         len(scope),
         ", ".join(sorted(scope)),
+        ", ".join(sorted(post_install_only)) or "none",
     )
     _logger.info("UT scope: test_tags=%s", test_tags)
     return test_tags
