@@ -12,10 +12,12 @@ Scope of a branch:
 
 * the modules whose files changed (submodule bumps included);
 * the repository modules depending on them, recursively (reverse dependencies);
-* the ``depends`` of the changed modules, direct and indirect (``sale_stock``,
-  then ``sale``, ``stock``...), i.e. the standard / OCA modules whose models
-  they may override, except ``IGNORED_DEPENDS``. Indirect ``depends`` are read
-  from the manifests of the Odoo addons paths. Only their ``post_install`` tests
+* the direct ``depends`` of the changed modules, i.e. the standard / OCA
+  modules they override, except ``IGNORED_DEPENDS``. The indirect ``depends``
+  (``sale_stock``, then ``sale``, ``stock``...) can be added, read from the
+  manifests of the Odoo addons paths: on Grant Alexander they cost 17 more
+  minutes for a few percent of the known regressions, which the full suite
+  catches anyway. Only their ``post_install`` tests
   run: their ``at_install`` tests run right after their own installation,
   before the modules depending on them are loaded, so they cannot catch a
   regression caused by an overriding module.
@@ -37,7 +39,8 @@ Activation (environment variables):
 * ``S6R_UT_REPO``: path of the project repository. When unset, it is the git
   superproject of this module (or its own repository).
 * ``S6R_UT_SCOPE_DEPENDS``: ``0`` to skip the ``depends`` of the changed
-  modules, ``direct`` to keep only their direct ``depends``.
+  modules, ``indirect`` to add their indirect ``depends`` (direct only by
+  default).
 
 The full suite is run whenever the scope cannot be computed reliably (no git,
 unknown base reference, changes in ``FULL_SUITE_FILES``), or when the last
@@ -308,7 +311,7 @@ def collect_depends(names, modules, transitive=True):
     return found - IGNORED_DEPENDS
 
 
-def compute_scope(files, modules, with_depends=True, all_modules=None, transitive=True):
+def compute_scope(files, modules, with_depends=True, all_modules=None, transitive=False):
     """Return the modules whose tests must run for the given changed files.
 
     :param set[str] files: changed paths, relative to the repository root
@@ -473,8 +476,8 @@ def apply_scope(config, environ=None, addons_paths=None):
         base_ref = environ.get("S6R_UT_BASE_REF")
         base_ref = verify_ref(repo, base_ref) if base_ref else detect_base_ref(repo)
         files = changed_files(repo, base_ref)
-        depends_mode = environ.get("S6R_UT_SCOPE_DEPENDS", "1")
-        transitive = depends_mode != "direct"
+        depends_mode = environ.get("S6R_UT_SCOPE_DEPENDS", "direct")
+        transitive = depends_mode == "indirect"
         all_modules = None
         if depends_mode != "0" and transitive:
             all_modules = find_all_manifests(default_addons_paths() if addons_paths is None else addons_paths)
