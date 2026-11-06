@@ -1,0 +1,507 @@
+# Copyright 2026 Scalizer (<https://www.scalizer.fr>)
+# License LGPL-3.0 or later (https://www.gnu.org/licenses/lgpl.html).
+"""Restrict the unit tests to the modules impacted by the current branch.
+
+The impacted modules are computed from ``git diff <base>...HEAD`` on the
+project repository, then injected into ``config['test_tags']``. Odoo reads
+this option each time it builds a test suite (``odoo.tests.loader.make_suite``),
+so every test suite built after this module is imported is filtered natively,
+before any ``setUpClass`` is executed.
+
+Scope of a branch:
+
+* the modules whose files changed (submodule bumps included);
+* the repository modules depending on them, recursively (reverse dependencies);
+* the direct ``depends`` of the changed modules, i.e. the standard / OCA
+  modules they override, except ``IGNORED_DEPENDS``. The indirect ``depends``
+  (``sale_stock``, then ``sale``, ``stock``...) can be added, read from the
+  manifests of the Odoo addons paths: on Grant Alexander they cost 17 more
+  minutes for a few percent of the known regressions, which the full suite
+  catches anyway. Only their ``post_install`` tests
+  run: their ``at_install`` tests run right after their own installation,
+  before the modules depending on them are loaded, so they cannot catch a
+  regression caused by an overriding module.
+
+A module whose changes are limited to its ``tests/`` directory does not
+propagate to its reverse dependencies nor to its ``depends``.
+
+Activation (environment variables):
+
+* ``S6R_UT_SCOPE``: ``1`` forces the targeted mode, ``0`` disables it.
+  When unset, it is enabled on Odoo.sh development builds only
+  (``ODOO_STAGE=dev``).
+* ``S6R_UT_BASE_REF``: git reference to diff against. When unset, it is
+  detected among the local and remote branches whose name matches
+  ``BASE_BRANCH_RE`` (``staging``, ``Staging``, ``staging-migration-19``,
+  ``16.0_staging``, ``main``...): the closest one to ``HEAD`` is used, i.e. the
+  one ``HEAD`` is the fewest commits ahead of, then behind. Branches into
+  which ``HEAD`` was already merged are ignored.
+* ``S6R_UT_REPO``: path of the project repository. When unset, it is the git
+  superproject of this module (or its own repository).
+* ``S6R_UT_SCOPE_DEPENDS``: ``0`` to skip the ``depends`` of the changed
+  modules, ``indirect`` to add their indirect ``depends`` (direct only by
+  default).
+
+The full suite is run whenever the scope cannot be computed reliably (no git,
+unknown base reference, changes in ``FULL_SUITE_FILES``), or when the last
+commit message contains ``FULL_SUITE_MARKER``.
+"""
+
+import ast
+import logging
+import os
+import re
+import subprocess
+
+_logger = logging.getLogger(__name__)
+
+# Name of the branches a development branch can be created from, without the
+# remote prefix. Matched case-insensitively.
+BASE_BRANCH_RE = re.compile(r"^(\d+\.\d+[_-])?(staging|main|master)([_-].*)?$", re.IGNORECASE)
+FULL_SUITE_MARKER = "[full-tests]"
+FULL_SUITE_FILES = {"requirements.txt"}
+SUBMODULE_MODE = "160000"
+# Fallback scope when no module changed: keep a minimal sanity run.
+EMPTY_SCOPE = {"s6r_unit_tests"}
+# Framework modules nearly every module depends on, directly or not: testing
+# them for each branch would cancel the benefit of the targeted mode, and their
+# heavy post_install suites (HTTP cases, tours, JS) rarely relate to a custom
+# module. They are still tested when they are themselves changed, and their
+# regressions are caught by the full suite (staging, daily testing branch).
+IGNORED_DEPENDS = {
+    # core
+    "base",
+    "base_import",
+    "base_setup",
+    "bus",
+    "http_routing",
+    "web",
+    # web client, editor and UI frameworks
+    "html_editor",
+    "web_cohort",
+    "web_editor",
+    "web_enterprise",
+    "web_gantt",
+    "web_map",
+    "web_mobile",
+    "web_studio",
+    "web_tour",
+    "web_unsplash",
+    # communication and portal
+    "auth_signup",
+    "auth_totp",
+    "digest",
+    "iap",
+    "mail",
+    "mail_bot",
+    "mail_enterprise",
+    "onboarding",
+    "partner_autocomplete",
+    "phone_validation",
+    "portal",
+    "sms",
+    "snailmail",
+    "utm",
+}
+
+
+class ScopeUnavailable(Exception):
+    """Raised when the targeted scope cannot be computed reliably."""
+
+
+def _git(repo, *args):
+    """Run a git command in ``repo`` and return its stripped output.
+
+    :param str repo: path of the git working tree
+    :param args: git arguments
+    :return: command output
+    :rtype: str
+    :raises ScopeUnavailable: if git fails
+    """
+    try:
+        return subprocess.check_output(
+            ["git", "-C", repo, *args], text=True, stderr=subprocess.DEVNULL, timeout=60
+        ).strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ScopeUnavailable(f"git {' '.join(args)} failed in {repo}: {error}") from error
+
+
+def find_repo_root(start):
+    """Return the project repository containing ``start``.
+
+    When ``start`` lives in a git submodule, the superproject is returned.
+
+    :param str start: path inside the repository
+    :return: absolute path of the repository root
+    :rtype: str
+    """
+    superproject = _git(start, "rev-parse", "--show-superproject-working-tree")
+    return superproject or _git(start, "rev-parse", "--show-toplevel")
+
+
+def verify_ref(repo, ref):
+    """Check that ``ref`` is a commit of ``repo``.
+
+    :param str repo: path of the git working tree
+    :param str ref: git reference
+    :return: ``ref``
+    :rtype: str
+    :raises ScopeUnavailable: if the reference does not exist
+    """
+    try:
+        _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    except ScopeUnavailable as error:
+        raise ScopeUnavailable(f"the base reference {ref} does not exist in {repo}") from error
+    return ref
+
+
+def base_branch_candidates(repo):
+    """Return the local and remote branches that may be the base of ``HEAD``.
+
+    :param str repo: path of the git working tree
+    :return: short reference names (``staging``, ``origin/staging``...)
+    :rtype: list[str]
+    """
+    refs = _git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes")
+    candidates = []
+    for ref in refs.splitlines():
+        name = ref.split("/", 1)[1] if ref.startswith(("origin/", "upstream/")) else ref
+        if name != "HEAD" and BASE_BRANCH_RE.match(name):
+            candidates.append(ref)
+    return candidates
+
+
+def detect_base_ref(repo, candidates=None):
+    """Return the base branch ``HEAD`` was most likely created from.
+
+    For each candidate, count the commits ``HEAD`` is ahead and behind. The
+    candidate with the fewest commits ahead, then behind, wins. A candidate
+    pointing exactly to ``HEAD`` (new branch without own commit) is returned
+    immediately. Candidates already containing ``HEAD`` with additional
+    commits (branch already merged into them) are ignored.
+
+    :param str repo: path of the git working tree
+    :param list[str] candidates: references to rank, :func:`base_branch_candidates` by default
+    :return: the selected reference
+    :rtype: str
+    :raises ScopeUnavailable: if no candidate is found
+    """
+    if candidates is None:
+        candidates = base_branch_candidates(repo)
+    ranked = []
+    for ref in candidates:
+        try:
+            behind, ahead = map(int, _git(repo, "rev-list", "--left-right", "--count", f"{ref}...HEAD").split())
+        except (ScopeUnavailable, ValueError):
+            continue
+        if not ahead and not behind:
+            # HEAD is the base branch itself: new branch without own commit
+            _logger.info("UT scope: HEAD is at %s, no own commit", ref)
+            return ref
+        if ahead:
+            ranked.append((ahead, behind, ref))
+    if not ranked:
+        raise ScopeUnavailable(f"no base branch found among {candidates} in {repo}")
+    ranked.sort()
+    _logger.info(
+        "UT scope: base branch candidates (ahead, behind): %s",
+        ", ".join(f"{ref} ({ahead}, {behind})" for ahead, behind, ref in ranked[:5]),
+    )
+    return ranked[0][2]
+
+
+def find_manifests(root):
+    """Return the modules found under ``root`` with their dependencies.
+
+    Modules are searched at any depth (submodules included), without
+    descending into a module directory.
+
+    :param str root: directory to scan
+    :return: ``{module_name: (relative_path, [depends])}``
+    :rtype: dict
+    """
+    modules = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith((".", "__"))]
+        if "__manifest__.py" not in filenames:
+            continue
+        dirnames[:] = []
+        try:
+            with open(os.path.join(dirpath, "__manifest__.py"), encoding="utf-8") as manifest_file:
+                manifest = ast.literal_eval(manifest_file.read())
+        except (OSError, SyntaxError, ValueError):
+            _logger.warning("UT scope: cannot parse the manifest of %s", dirpath)
+            continue
+        modules[os.path.basename(dirpath)] = (
+            os.path.relpath(dirpath, root),
+            list(manifest.get("depends", [])),
+        )
+    return modules
+
+
+def changed_files(repo, base_ref, head="HEAD"):
+    """Return the files changed between the merge base of ``base_ref`` and ``head``.
+
+    Submodule bumps are expanded into the files changed inside the submodule.
+    If the submodule commits are not available, the submodule directory itself
+    is returned so that all its modules are considered as changed.
+
+    :param str repo: path of the git working tree
+    :param str base_ref: reference to diff against
+    :param str head: reference of the branch
+    :return: paths relative to ``repo``
+    :rtype: set[str]
+    """
+    files = set()
+    raw = _git(repo, "diff", "--raw", "--no-abbrev", "--no-renames", f"{base_ref}...{head}")
+    for line in raw.splitlines():
+        meta, path = line.split("\t", 1)
+        old_mode, new_mode, old_sha, new_sha = meta.lstrip(":").split()[:4]
+        if SUBMODULE_MODE not in (old_mode, new_mode):
+            files.add(path)
+            continue
+        sub_repo = os.path.join(repo, path)
+        try:
+            if old_mode != SUBMODULE_MODE or new_mode != SUBMODULE_MODE:
+                raise ScopeUnavailable("submodule added or removed")
+            sub_files = _git(sub_repo, "diff", "--name-only", old_sha, new_sha)
+            files.update(os.path.join(path, f) for f in sub_files.splitlines())
+        except ScopeUnavailable:
+            files.add(os.path.join(path, ""))
+    return files
+
+
+def find_all_manifests(paths):
+    """Return the dependencies of the modules found in the given addons paths.
+
+    The first path containing a module wins, as in Odoo's addons path.
+
+    :param list[str] paths: addons paths
+    :return: ``{module_name: (relative_path, [depends])}``
+    :rtype: dict
+    """
+    modules = {}
+    for path in paths:
+        if os.path.isdir(path):
+            for name, value in find_manifests(path).items():
+                modules.setdefault(name, value)
+    return modules
+
+
+def collect_depends(names, modules, transitive=True):
+    """Return the ``depends`` of ``names``, recursively when ``transitive``.
+
+    ``IGNORED_DEPENDS`` are left out of the result but still traversed.
+
+    :param set[str] names: module names
+    :param dict modules: ``{module_name: (path, [depends])}``
+    :param bool transitive: follow the ``depends`` of the ``depends``
+    :return: module names
+    :rtype: set[str]
+    """
+    found = set()
+    todo = [dep for name in names for dep in modules.get(name, ("", []))[1]]
+    while todo:
+        name = todo.pop()
+        if name in found:
+            continue
+        found.add(name)
+        if transitive:
+            todo.extend(modules.get(name, ("", []))[1])
+    return found - IGNORED_DEPENDS
+
+
+def compute_scope(files, modules, with_depends=True, all_modules=None, transitive=False):
+    """Return the modules whose tests must run for the given changed files.
+
+    :param set[str] files: changed paths, relative to the repository root
+    :param dict modules: result of :func:`find_manifests` on the repository
+    :param bool with_depends: include the ``depends`` of the changed modules
+    :param dict all_modules: manifests of every available module, used to follow
+        the indirect ``depends`` (:func:`find_all_manifests`); ``modules`` by default
+    :param bool transitive: include the indirect ``depends`` too
+    :return: ``(scope, post_install_only)``: the modules whose tests all run,
+        and the direct ``depends`` whose ``post_install`` tests only run
+    :rtype: tuple[set[str], set[str]]
+    :raises ScopeUnavailable: if a file requires the full suite
+    """
+    if FULL_SUITE_FILES & {os.path.basename(f) for f in files}:
+        raise ScopeUnavailable(f"changes in {FULL_SUITE_FILES} require the full suite")
+
+    touched = set()  # any change in the module
+    propagating = set()  # change outside tests/: impacts dependents
+    for name, (path, _depends) in modules.items():
+        prefix = path.rstrip("/") + "/"
+        for changed in files:
+            if changed.startswith(prefix):
+                touched.add(name)
+                if not changed[len(prefix) :].startswith("tests/"):
+                    propagating.add(name)
+                    break
+            elif prefix.startswith(changed) and changed.endswith("/"):
+                # whole directory changed (unavailable submodule bump)
+                touched.add(name)
+                propagating.add(name)
+                break
+
+    scope = set(touched)
+    impacted = set(propagating)
+    while True:
+        dependents = {
+            name for name, (_path, depends) in modules.items() if impacted & set(depends)
+        } - impacted
+        if not dependents:
+            break
+        impacted |= dependents
+    scope |= impacted
+    post_install_only = set()
+    if with_depends:
+        graph = dict(all_modules or {})
+        graph.update(modules)
+        post_install_only = collect_depends(propagating, graph, transitive)
+    return scope, post_install_only - scope
+
+
+def split_test_tags(spec):
+    """Split a ``test_tags`` value into its filter specs.
+
+    Like ``odoo.tests.tag_selector.TagsSelector``, commas inside ``[...]``
+    parameters or escaped with ``\\`` do not separate specs. The specs are
+    returned as written (escapes kept), so that joining them back with commas
+    gives an equivalent value.
+
+    :param str spec: ``test_tags`` value
+    :return: stripped, non-empty filter specs
+    :rtype: list[str]
+    """
+    parts = [""]
+    bracket_level = 0
+    escape_next = False
+    for char in spec or "":
+        if escape_next:
+            escape_next = False
+        elif char == "\\":
+            escape_next = True
+        elif char == "[":
+            bracket_level += 1
+        elif char == "]":
+            bracket_level = max(bracket_level - 1, 0)
+        elif char == "," and not bracket_level:
+            parts.append("")
+            continue
+        parts[-1] += char
+    return [part.strip() for part in parts if part.strip()]
+
+
+def build_test_tags(scope, existing=None, post_install_only=()):
+    """Combine ``scope`` with the existing ``test_tags`` option.
+
+    Exclusions are kept. Inclusions without module are restricted to the
+    scope (``tag`` becomes ``tag/module``), inclusions with a module are kept
+    when the module is in the scope. The ``at_install`` tests of the
+    ``post_install_only`` modules are excluded (``-at_install/module``).
+
+    :param set[str] scope: module names whose tests all run
+    :param str existing: current value of ``test_tags``
+    :param set[str] post_install_only: module names whose ``post_install`` tests only run
+    :return: the new ``test_tags`` value
+    :rtype: str
+    """
+    modules = set(scope) | set(post_install_only)
+    specs = split_test_tags(existing)
+    excludes = [s for s in specs if s.startswith("-")]
+    includes = [s.lstrip("+") for s in specs if not s.startswith("-")]
+    if not includes:
+        includes = ["standard"]
+    result = []
+    for spec in includes:
+        if "/" in spec:
+            module = spec.split("/", 1)[1].split(":", 1)[0].split(".", 1)[0]
+            if module in modules:
+                result.append(spec)
+            continue
+        tag, sep, rest = spec.partition(":")
+        result.extend(f"{tag}/{module}{sep}{rest}" for module in sorted(modules))
+    excludes = [f"-at_install/{module}" for module in sorted(post_install_only)] + excludes
+    return ",".join(result + excludes)
+
+
+def is_enabled(environ=None):
+    """Tell whether the targeted mode must be used.
+
+    :param dict environ: environment, ``os.environ`` by default
+    :rtype: bool
+    """
+    environ = os.environ if environ is None else environ
+    forced = environ.get("S6R_UT_SCOPE")
+    if forced is not None:
+        return forced.strip().lower() in ("1", "true", "yes")
+    return environ.get("ODOO_STAGE") == "dev"
+
+
+def default_addons_paths():
+    """Return the addons paths of the running Odoo, or an empty list.
+
+    :rtype: list[str]
+    """
+    try:
+        import odoo.addons  # noqa: PLC0415
+
+        return list(odoo.addons.__path__)
+    except ImportError:
+        return []
+
+
+def apply_scope(config, environ=None, addons_paths=None):
+    """Restrict ``config['test_tags']`` to the modules impacted by the branch.
+
+    Does nothing (full suite) when the targeted mode is disabled or the scope
+    cannot be computed.
+
+    :param config: Odoo configuration manager
+    :param dict environ: environment, ``os.environ`` by default
+    :param list[str] addons_paths: addons paths to read the indirect ``depends``
+        from, those of the running Odoo by default
+    :return: the applied ``test_tags``, or ``None`` when the full suite runs
+    :rtype: str | None
+    """
+    environ = os.environ if environ is None else environ
+    if not is_enabled(environ):
+        return None
+    try:
+        repo = environ.get("S6R_UT_REPO") or find_repo_root(os.path.dirname(os.path.abspath(__file__)))
+        if FULL_SUITE_MARKER in _git(repo, "log", "-1", "--format=%B"):
+            _logger.info("UT scope: %s found in the last commit, running the full suite", FULL_SUITE_MARKER)
+            return None
+        base_ref = environ.get("S6R_UT_BASE_REF")
+        base_ref = verify_ref(repo, base_ref) if base_ref else detect_base_ref(repo)
+        files = changed_files(repo, base_ref)
+        depends_mode = environ.get("S6R_UT_SCOPE_DEPENDS", "direct")
+        transitive = depends_mode == "indirect"
+        all_modules = None
+        if depends_mode != "0" and transitive:
+            all_modules = find_all_manifests(default_addons_paths() if addons_paths is None else addons_paths)
+        scope, post_install_only = compute_scope(
+            files,
+            find_manifests(repo),
+            with_depends=depends_mode != "0",
+            all_modules=all_modules,
+            transitive=transitive,
+        )
+    except ScopeUnavailable as error:
+        _logger.warning("UT scope: %s, running the full suite", error)
+        return None
+    if not scope:
+        scope = set(EMPTY_SCOPE)
+    test_tags = build_test_tags(scope, config["test_tags"], post_install_only)
+    config["test_tags"] = test_tags
+    _logger.info(
+        "UT scope: %d changed file(s) since %s, %d module(s) to test: %s; post_install only: %s",
+        len(files),
+        base_ref,
+        len(scope),
+        ", ".join(sorted(scope)),
+        ", ".join(sorted(post_install_only)) or "none",
+    )
+    _logger.info("UT scope: test_tags=%s", test_tags)
+    return test_tags

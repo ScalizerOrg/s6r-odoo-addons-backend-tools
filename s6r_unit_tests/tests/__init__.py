@@ -4,6 +4,8 @@
 # in v18+, trying to import odoo.tests when test_enable is False will print a logger.error
 from odoo.tools import config
 if config['test_enable']:
+    from . import scope
+    scope.apply_scope(config)
     from . import runner
     from . import loader
     from . import common
